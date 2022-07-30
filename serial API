@@ -1,0 +1,113 @@
+Before a site can connect to a serial device it must request access. If a site only supports communciating with a subset of all potential devices then it can provide a filter which will limit the set of selectable devices to those matching certain properties such as a USB vendor ID.
+
+const filter = {
+  usbVendorId: 0x2341 // Arduino SA
+};
+
+try {
+  const port = await navigator.serial.requestPort({filters: [filter]});
+  // Continue connecting to |port|.
+} catch (e) {
+  // Permission to access a device was denied implicitly or explicitly by the user.
+}
+With access to a SerialPort instance the site may now open a connection to the port. Most parameters to open() are optional however the baud rate is required as there is no sensible default. You as the developer must know the rate at which your device expects to communicate.
+
+await port.open({ baudRate: /* pick your baud rate */ });
+At this point the readable and writable attributes are populated with a ReadableStream and WritableStream that can be used to receive data from and send data to the connected device.
+
+In this example we assume a device implementing a protocol inspired by the Hayes command set. Since commands are encoded in ASCII a TextEncoder and TextDecoder are used to translate the Uint8Arrays used by the SerialPort's streams to and from strings.
+
+const encoder = new TextEncoder();
+const writer = port.writable.getWriter();
+writer.write(encoder.encode("AT"));
+
+const decoder = new TextDecoder();
+const reader = port.readable.getReader();
+const { value, done } = await reader.read();
+console.log(decoder.decode(value));
+// Expected output: OK
+The readable and writable streams must be unlocked before the port can be closed.
+
+writer.releaseLock();
+reader.releaseLock();
+await port.close();
+Rather than reading a single chunk from the stream code will often read continuously using a loop like this,
+
+const reader = port.readable.getReader();
+while (true) {
+  const { value, done } = await reader.read();
+  if (done) {
+    // |reader| has been canceled.
+    break;
+  }
+  // Do something with |value|...
+}
+reader.releaseLock();
+In this case port.readable will not be unlocked until the stream encounters an error, so how do you close the port? Calling cancel() on reader will cause the Promise returned by read() to resolve immediately with { value: undefined, done: true }. This will cause the code above to break out of the loop and unlock the stream so that the port can be closed,
+
+await reader.cancel();
+await port.close();
+A serial port may generate one of a number of non-fatal read errors for conditions such as buffer overflow, framing or parity errors. These are thrown as exceptions from the read() method and cause the ReadableStream to become errored. If the error is non-fatal then port.readable is immediately replaced by a new ReadableStream that picks up right after the error. To expand the example above to handle these errors another loop is added,
+
+while (port.readable) {
+  const reader = port.readable.getReader();
+  while (true) {
+    let value, done;
+    try {
+      ({ value, done } = await reader.read());
+    } catch (error) {
+      // Handle |error|...
+      break;
+    }
+    if (done) {
+      // |reader| has been canceled.
+      break;
+    }
+    // Do something with |value|...
+  }
+  reader.releaseLock();
+}
+If a fatal error occurs, such as a USB device being removed, then port.readable will be set to null.
+
+Revisiting the earlier example, for a device that always produces ASCII text the explicit calls to encode() and decode() can be removed through the use of TransformStreams. In this example writer comes from a TextEncoderStream and reader comes from a TextDecoderStream. The pipeTo() method is used to connect these transforms to the port.
+
+const encoder = new TextEncoderStream();
+const writableStreamClosed = encoder.readable.pipeTo(port.writable);
+const writer = encoder.writable.getWriter();
+writer.write("AT");
+
+const decoder = new TextDecoderStream();
+const readableStreamClosed = port.readable.pipeTo(decoder.writable);
+const reader = decoder.readable.getReader();
+const { value, done } = await reader.read();
+console.log(value);
+// Expected output: OK
+When piping through a transform stream closing the port becomes more complicated. Closing reader or writer will cause an error to propagate through the transform streams to the underlying port. However, this propagation doesn't happen immediately. The new writableStreamClosed and readableStreamClosed promises are required to detect when port.readable and port.writable have been unlocked. Since canceling reader causes the stream to be aborted the resulting error must be caught and ignored,
+
+writer.close();
+await writableStreamClosed;
+reader.cancel();
+await readableStreamClosed.catch(reason => {});
+await port.close();
+Serial ports include a number of additional signals for device detection and flow control which can be queried and set explicitly. As an example, some devices like the Arduino will enter a programming mode if the Data Terminal Ready (DTR) signal is toggled.
+
+await port.setSignal({ dataTerminalReady: false });
+await new Promise(resolve => setTimeout(200, resolve));
+await port.setSignal({ dataTerminalReady: true });
+If a serial port is provided by a USB device then that device may be connected or disconnected from the system. Once a site has permission to access a port it can receive these events and query for the set of connected devices it currently has access to.
+
+// Check to see what ports are available when the page loads.
+document.addEventListener('DOMContentLoaded', async () => {
+  let ports = await navigator.serial.getPorts();
+  // Populate the UI with options for the user to select or automatically
+  // connect to devices.
+});
+
+navigator.serial.addEventListener('connect', e => {
+  // Add |e.target| to the UI or automatically connect.
+});
+
+navigator.serial.addEventListener('disconnect', e => {
+  // Remove |e.target| from the UI. If the device was open the disconnection can
+  // also be observed as a stream error.
+});
